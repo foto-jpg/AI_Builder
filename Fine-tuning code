@@ -1,0 +1,170 @@
+"""Fine-tune the pretrained CREPE model on violin audio (MOSA subset).
+
+Approach
+--------
+* Start from `torchcrepe`'s pretrained `Crepe('full')` weights — the same CNN
+  the original CREPE paper trained on mixed instruments.
+* Build (frame[1024] @ 16 kHz, target[360 cent-bins]) pairs from the prepared
+  MOSA violin data (see dataset.py). The target is a Gaussian bump over the
+  pitch-classification bins, exactly as in the CREPE paper.
+* Train with **binary cross-entropy per bin** (CREPE's original loss — each of
+  the 360 bins is an independent sigmoid), Adam, a small LR (we are fine-tuning,
+  not training from scratch), early stopping on a held-out split of recordings.
+* Optionally freeze the early conv blocks and only fine-tune the last conv
+  block + the classifier (`--freeze-early`) — useful when the violin set is
+  small, to avoid catastrophic forgetting.
+* Save the fine-tuned `state_dict` to `backend/checkpoints/crepe_violin.pt`.
+  `audio_engine.py` picks it up automatically if `CREPE_CHECKPOINT` is set.
+
+Run
+---
+    backend/venv/bin/python backend/training/finetune_crepe.py \
+        --data datasets/MOSA/violin \
+        --epochs 15 --batch-size 256 --lr 1e-4 \
+        --out backend/checkpoints/crepe_violin.pt
+
+Use `--device cuda` (default auto). For the 3070 Ti, batch-size 128–256 is fine.
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import random
+from pathlib import Path
+
+import numpy as np
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Fine-tune CREPE on violin audio")
+    ap.add_argument("--data", required=True, type=Path, help="prepared dir (audio/ + notes/)")
+    ap.add_argument("--out", type=Path, default=Path("backend/checkpoints/crepe_violin.pt"))
+    ap.add_argument("--epochs", type=int, default=15)
+    ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--hop-ms", type=float, default=10.0)
+    ap.add_argument("--val-frac", type=float, default=0.15, help="fraction of *recordings* held out")
+    ap.add_argument("--freeze-early", action="store_true", help="train only last conv block + classifier")
+    ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--patience", type=int, default=4)
+    args = ap.parse_args()
+
+    random.seed(args.seed); np.random.seed(args.seed)
+
+    import torch
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader, Subset
+    import torchcrepe
+
+    from dataset import CrepeFrameDataset, CREPE_BINS  # local import
+
+    device = args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu"
+    torch.manual_seed(args.seed)
+    print(f"[finetune] device={device}")
+
+    # ── data ──────────────────────────────────────────────────────────────
+    ds = CrepeFrameDataset(args.data, hop_ms=args.hop_ms, seed=args.seed)
+    if len(ds) == 0:
+        raise SystemExit("No training frames found — did you run dataset.py to prepare MOSA?")
+
+    # split by *recording* so frames from one piece never straddle train/val
+    rec_paths = sorted({p for p, _, _ in ds._index})
+    random.Random(args.seed).shuffle(rec_paths)
+    n_val_rec = max(1, int(len(rec_paths) * args.val_frac))
+    val_recs = set(rec_paths[:n_val_rec])
+    train_idx = [i for i, (p, _, _) in enumerate(ds._index) if p not in val_recs]
+    val_idx   = [i for i, (p, _, _) in enumerate(ds._index) if p in val_recs]
+    print(f"[finetune] {len(train_idx)} train / {len(val_idx)} val frames "
+          f"({len(rec_paths) - n_val_rec} / {n_val_rec} recordings)")
+
+    train_dl = DataLoader(Subset(ds, train_idx), batch_size=args.batch_size,
+                          shuffle=True, num_workers=2, pin_memory=(device == "cuda"))
+    val_dl   = DataLoader(Subset(ds, val_idx), batch_size=args.batch_size,
+                          shuffle=False, num_workers=2, pin_memory=(device == "cuda"))
+
+    # ── model: load pretrained CREPE weights ──────────────────────────────
+    import os
+    model = torchcrepe.Crepe("full")
+    weights_file = os.path.join(os.path.dirname(torchcrepe.__file__), "assets", "full.pth")
+    model.load_state_dict(torch.load(weights_file, map_location=device, weights_only=True))
+    model.to(device)
+
+    if args.freeze_early:
+        # CREPE = 6 conv blocks (conv1..conv6 [+ *_BN]) + classifier. Freeze 1..5.
+        for name, p in model.named_parameters():
+            if name.startswith(("conv1", "conv2", "conv3", "conv4", "conv5")):
+                p.requires_grad_(False)
+        trainable = sorted({n.split(".")[0] for n, p in model.named_parameters() if p.requires_grad})
+        print(f"[finetune] frozen early blocks; training: {trainable}")
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.Adam(params, lr=args.lr)
+
+    def step(frames: "torch.Tensor", targets: "torch.Tensor"):
+        # torchcrepe.Crepe.forward expects [batch, 1024]; outputs [batch, 360] probs
+        frames = frames.to(device); targets = targets.to(device)
+        probs = model(frames, embed=False)           # sigmoid already applied inside
+        # numerical-stable BCE on probabilities
+        eps = 1e-7
+        probs = probs.clamp(eps, 1 - eps)
+        loss = -(targets * probs.log() + (1 - targets) * (1 - probs).log()).mean()
+        return loss, probs
+
+    def pitch_mae_cents(probs: "torch.Tensor", targets: "torch.Tensor") -> float:
+        """Mean abs error in cents between argmax-decoded pitch and target peak,
+        over voiced frames only."""
+        voiced = targets.sum(dim=1) > 0
+        if voiced.sum() == 0:
+            return float("nan")
+        from dataset import _CENTS_MAPPING
+        cmap = torch.as_tensor(_CENTS_MAPPING, device=probs.device, dtype=probs.dtype)
+        pred_c = (probs[voiced] * cmap).sum(1) / probs[voiced].sum(1).clamp_min(1e-8)
+        true_c = (targets[voiced] * cmap).sum(1) / targets[voiced].sum(1).clamp_min(1e-8)
+        return (pred_c - true_c).abs().mean().item()
+
+    # ── train loop ────────────────────────────────────────────────────────
+    best_val = math.inf
+    bad_epochs = 0
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        tr_loss = 0.0; nb = 0
+        for frames, targets in train_dl:
+            opt.zero_grad()
+            loss, _ = step(frames, targets)
+            loss.backward()
+            opt.step()
+            tr_loss += loss.item(); nb += 1
+        tr_loss /= max(nb, 1)
+
+        model.eval()
+        va_loss = 0.0; va_mae = 0.0; nb = 0; nm = 0
+        with torch.no_grad():
+            for frames, targets in val_dl:
+                loss, probs = step(frames, targets)
+                va_loss += loss.item(); nb += 1
+                mae = pitch_mae_cents(probs, targets.to(device))
+                if not math.isnan(mae):
+                    va_mae += mae; nm += 1
+        va_loss /= max(nb, 1)
+        va_mae /= max(nm, 1)
+        print(f"epoch {epoch:2d}  train_loss={tr_loss:.4f}  val_loss={va_loss:.4f}  "
+              f"val_pitch_MAE={va_mae:.1f} cents")
+
+        if va_loss < best_val - 1e-4:
+            best_val = va_loss; bad_epochs = 0
+            torch.save(model.state_dict(), args.out)
+            print(f"  ↳ saved {args.out}")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= args.patience:
+                print(f"[finetune] early stop (no val improvement for {args.patience} epochs)")
+                break
+
+    print(f"[finetune] done — best val_loss={best_val:.4f}; checkpoint at {args.out}")
+
+
+if __name__ == "__main__":
+    main()
